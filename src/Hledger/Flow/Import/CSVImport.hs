@@ -151,6 +151,7 @@ hledgerImport opts ch csvSrc journalOut = do
 hledgerImport' :: RuntimeOptions -> TChan FlowTypes.LogMessage -> ImportDirs -> TurtlePath -> TurtlePath -> IO TurtlePath
 hledgerImport' opts ch importDirs csvSrc journalOut = do
   let candidates = rulesFileCandidates csvSrc importDirs
+  
   maybeRulesFile <- firstExistingFile candidates
   let relCSV = relativeToBase opts csvSrc
   case maybeRulesFile of
@@ -165,6 +166,9 @@ hledgerImport' opts ch importDirs csvSrc journalOut = do
             ]
 
       let cmdLabel = Turtle.format ("importing '" % Turtle.fp % "' using rules file '" % Turtle.fp % "'") relCSV relRules
+
+      logVerbose opts ch $ Turtle.format ("Rules file candidates:\n" % Turtle.s) 
+          (T.intercalate "\n" $ map (Turtle.format Turtle.fp) candidates)
       ((_, stdOut, _), _) <- timeAndExitOnErr opts ch cmdLabel dummyLogger channelErr (parAwareProc opts) (hledger, args, Turtle.empty)
       let withoutDryRunText = T.unlines $ drop 2 $ T.lines stdOut
       _ <- T.writeFile journalOut withoutDryRunText
@@ -199,14 +203,10 @@ generalRulesFiles importDirs = do
 
 statementSpecificRulesFiles :: TurtlePath -> ImportDirs -> [TurtlePath]
 statementSpecificRulesFiles csvSrc importDirs = do
-  let srcSuffix = snd $ T.breakOnEnd "_" (Turtle.format Turtle.fp (Turtle.basename csvSrc))
-
-  if ((T.take 3 srcSuffix) == "rfo")
-    then
-    do
-      let srcSpecificFilename = T.unpack srcSuffix <.> "rules"
-      map (</> srcSpecificFilename) [accountDir importDirs, bankDir importDirs, importDir importDirs]
-    else []
+  let srcBasename = T.unpack (Turtle.format Turtle.fp (Turtle.basename csvSrc))
+  let srcLeafDir = T.unpack (Turtle.format Turtle.fp (Turtle.dirname csvSrc))
+  let srcSpecificFilename = srcBasename <.> "rules"
+  [accountDir importDirs </> "rules" </> srcLeafDir </> srcSpecificFilename]
 
 customConstruct :: RuntimeOptions -> TChan FlowTypes.LogMessage -> TurtlePath -> Turtle.Line -> Turtle.Line -> Turtle.Line -> TurtlePath -> TurtlePath -> IO TurtlePath
 customConstruct opts ch constructScript bank account owner csvSrc journalOut = do
