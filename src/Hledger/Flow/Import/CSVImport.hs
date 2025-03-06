@@ -98,7 +98,21 @@ importCSV opts ch importDirs srcFile = do
             -- Check if journalOut is older than csvFile
             csvModTime <- getModificationTime csvFile
             journalModTime <- getModificationTime journalOut
-            return (csvModTime > journalModTime)))
+
+            -- Check if any rules file candidate is newer than the journal file
+            let rulesCandidates = rulesFileCandidates csvFile importDirs
+            rulesFilesNewer <- if null rulesCandidates
+                               then return False
+                               else do
+                                 rulesFilesExist <- filterM (verboseTestFile opts ch) rulesCandidates
+                                 if null rulesFilesExist
+                                   then return False
+                                   else do
+                                     rulesFileModTimes <- mapM getModificationTime rulesFilesExist
+                                     return $ any (> journalModTime) rulesFileModTimes
+
+            -- Import if csv is newer OR if any rules file is newer
+            return (csvModTime > journalModTime || rulesFilesNewer)))
     else return True
 
   importFun <- if shouldImport
