@@ -23,6 +23,9 @@ import Hledger.Flow.RuntimeOptions
 import Control.Concurrent.STM
 import Control.Monad
 import Data.Maybe (fromMaybe, isNothing)
+import qualified System.PosixCompat.Files as PosixFiles
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Data.Time.Clock (UTCTime(..))
 
 type FileWasGenerated = Bool
 
@@ -73,6 +76,12 @@ extractAndImport opts ch inputFile = do
     Left errorMessage -> do
       errExit 1 ch errorMessage (inputFile, False)
 
+getModificationTime :: TurtlePath -> IO UTCTime
+getModificationTime path = do
+    stat <- Turtle.stat path
+    -- Convert modification time from FileStatus to UTCTime
+    return $ posixSecondsToUTCTime $ realToFrac $ PosixFiles.modificationTime stat
+
 importCSV :: RuntimeOptions -> TChan FlowTypes.LogMessage -> ImportDirs -> TurtlePath -> IO (TurtlePath, FileWasGenerated)
 importCSV opts ch importDirs srcFile = do
   let preprocessScript = accountDir importDirs </> "preprocess"
@@ -82,8 +91,14 @@ importCSV opts ch importDirs srcFile = do
   let ownerName = importDirLine ownerDir importDirs
   (csvFile, preprocessHappened) <- preprocessIfNeeded opts ch preprocessScript bankName accountName ownerName srcFile
   let journalOut = changePathAndExtension "3-journal/" "journal" csvFile
-  shouldImport <- if onlyNewFiles opts && not preprocessHappened
-    then not <$> verboseTestFile opts ch journalOut
+  shouldImport <- if onlyNewFiles opts
+    then do
+      journalExists <- verboseTestFile opts ch journalOut
+      (if not journalExists || preprocessHappened then return True else (do
+            -- Check if journalOut is older than csvFile
+            csvModTime <- getModificationTime csvFile
+            journalModTime <- getModificationTime journalOut
+            return (csvModTime > journalModTime)))
     else return True
 
   importFun <- if shouldImport
@@ -102,13 +117,42 @@ constructOrImport opts ch constructScript bankName accountName ownerName = do
     then return $ customConstruct opts ch constructScript bankName accountName ownerName
     else return $ hledgerImport opts ch
 
+-- | Check if the first file is older than any of the files in the given list.
+-- Returns True if the target file is older than at least one of the source files.
+-- If any of the files doesn't exist, returns False.
+isFileOlder :: TurtlePath -> [TurtlePath] -> IO Bool
+isFileOlder target sourceFiles = do
+    targetExists <- Turtle.testfile target
+    if not targetExists
+        then return False
+        else do
+            targetTime <- getModificationTime target
+            sourceTimesAndExists <- mapM getTimeIfExists sourceFiles
+            -- Only consider files that exist
+            let sourceTimes = [time | (exists, time) <- sourceTimesAndExists, exists]
+            -- Target is older if any source is newer than target
+            return $ any (> targetTime) sourceTimes
+  where
+    getTimeIfExists :: TurtlePath -> IO (Bool, UTCTime)
+    getTimeIfExists path = do
+        exists <- Turtle.testfile path
+        if exists
+            then do
+                time <- getModificationTime path
+                return (True, time)
+            else return (False, UTCTime (toEnum 0) 0)
+
 preprocessIfNeeded :: RuntimeOptions -> TChan FlowTypes.LogMessage -> TurtlePath -> Turtle.Line -> Turtle.Line -> Turtle.Line -> TurtlePath -> IO (TurtlePath, Bool)
 preprocessIfNeeded opts ch script bank account owner src = do
   let csvOut = changePathAndExtension "2-preprocessed/" "csv" src
   scriptExists <- verboseTestFile opts ch script
   targetExists <- verboseTestFile opts ch csvOut
-  shouldProceed <- if onlyNewFiles opts 
-    then return $ scriptExists && not targetExists
+  shouldProceed <- if onlyNewFiles opts
+    then do
+      isTargetOlder <- if targetExists
+                       then isFileOlder csvOut [script, src]
+                       else return True
+      return $ scriptExists && (not targetExists || isTargetOlder)
     else return scriptExists
   if shouldProceed
     then do
@@ -151,7 +195,7 @@ hledgerImport opts ch csvSrc journalOut = do
 hledgerImport' :: RuntimeOptions -> TChan FlowTypes.LogMessage -> ImportDirs -> TurtlePath -> TurtlePath -> IO TurtlePath
 hledgerImport' opts ch importDirs csvSrc journalOut = do
   let candidates = rulesFileCandidates csvSrc importDirs
-  
+
   maybeRulesFile <- firstExistingFile candidates
   let relCSV = relativeToBase opts csvSrc
   case maybeRulesFile of
@@ -167,7 +211,7 @@ hledgerImport' opts ch importDirs csvSrc journalOut = do
 
       let cmdLabel = Turtle.format ("importing '" % Turtle.fp % "' using rules file '" % Turtle.fp % "'") relCSV relRules
 
-      logVerbose opts ch $ Turtle.format ("Rules file candidates:\n" % Turtle.s) 
+      logVerbose opts ch $ Turtle.format ("Rules file candidates:\n" % Turtle.s)
           (T.intercalate "\n" $ map (Turtle.format Turtle.fp) candidates)
       ((_, stdOut, _), _) <- timeAndExitOnErr opts ch cmdLabel dummyLogger channelErr (parAwareProc opts) (hledger, args, Turtle.empty)
       let withoutDryRunText = T.unlines $ drop 2 $ T.lines stdOut
