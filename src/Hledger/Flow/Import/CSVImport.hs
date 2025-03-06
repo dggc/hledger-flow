@@ -6,7 +6,8 @@ module Hledger.Flow.Import.CSVImport
 
 import qualified Turtle hiding (stdout, stderr, proc, procStrictWithErr)
 import Turtle ((%), (</>), (<.>))
-import Prelude hiding (putStrLn, take, writeFile)
+import Prelude hiding (putStrLn, writeFile)
+import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Data.List.NonEmpty as NonEmpty
@@ -22,7 +23,7 @@ import Hledger.Flow.Logging
 import Hledger.Flow.RuntimeOptions
 import Control.Concurrent.STM
 import Control.Monad
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isNothing, mapMaybe)
 import qualified System.PosixCompat.Files as PosixFiles
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Clock (UTCTime(..))
@@ -82,6 +83,44 @@ getModificationTime path = do
     -- Convert modification time from FileStatus to UTCTime
     return $ posixSecondsToUTCTime $ realToFrac $ PosixFiles.modificationTime stat
 
+-- | Recursively collect all files imported in rules files
+collectImportedFiles :: RuntimeOptions -> TChan FlowTypes.LogMessage -> [TurtlePath] -> IO [TurtlePath]
+collectImportedFiles opts ch initialFiles = do
+  let loop seen [] = return (S.toList seen)
+      loop seen (file:rest) = do
+        if file `S.member` seen
+          then loop seen rest  -- Skip if already processed to avoid cycles
+          else do
+            imports <- extractImports opts ch file
+            let newSeen = S.insert file seen
+            loop newSeen (imports ++ rest)
+
+  loop S.empty initialFiles
+
+-- | Extract import statements from a rules file
+extractImports :: RuntimeOptions -> TChan FlowTypes.LogMessage -> TurtlePath -> IO [TurtlePath]
+extractImports opts ch filePath = do
+  logVerbose opts ch $ "Checking for includes in " <> Turtle.format Turtle.fp filePath
+  fileContent <- T.readFile filePath
+  let importLines = filter (T.isPrefixOf "include") $ T.lines fileContent
+      importPaths = mapMaybe extractImportPath importLines
+      -- Resolve relative paths based on the directory of the current file
+      inlineBaseDir = Turtle.directory filePath
+      resolvedPaths = map (\p -> if Turtle.isAbsolute p then p else inlineBaseDir </> p) importPaths
+
+  -- Check if the imported files exist
+  filterM (verboseTestFile opts ch) resolvedPaths
+
+extractImportPath :: T.Text -> Maybe TurtlePath
+extractImportPath line =
+  case T.words line of
+    ("include":path:_) -> Just (removeQuotes path)
+    _ -> Nothing
+  where
+    removeQuotes s = case T.unpack s of
+      '"':rest -> take (length rest - 1) rest  -- Remove quotes and return a String
+      _ -> T.unpack s  -- Just convert to String directly
+
 importCSV :: RuntimeOptions -> TChan FlowTypes.LogMessage -> ImportDirs -> TurtlePath -> IO (TurtlePath, FileWasGenerated)
 importCSV opts ch importDirs srcFile = do
   let preprocessScript = accountDir importDirs </> "preprocess"
@@ -108,10 +147,14 @@ importCSV opts ch importDirs srcFile = do
                                  if null rulesFilesExist
                                    then return False
                                    else do
-                                     rulesFileModTimes <- mapM getModificationTime rulesFilesExist
-                                     return $ any (> journalModTime) rulesFileModTimes
+                                     -- Find all imported files recursively and check their modification times
+                                     allRelevantFiles <- collectImportedFiles opts ch rulesFilesExist
+                                     allFileModTimes <- mapM getModificationTime allRelevantFiles
+                                     logVerbose opts ch $ Turtle.format ("Journal: " % Turtle.s) (T.pack srcFile)
+                                     logVerbose opts ch $ Turtle.format ("Relevant files: " % Turtle.s) (T.pack $ show allRelevantFiles)
+                                     return $ any (> journalModTime) allFileModTimes
 
-            -- Import if csv is newer OR if any rules file is newer
+            -- Import if csv is newer OR if any rules file or its imports are newer
             return (csvModTime > journalModTime || rulesFilesNewer)))
     else return True
 
@@ -284,3 +327,4 @@ customConstruct opts ch constructScript bank account owner csvSrc journalOut = d
   let cmdLabel = Turtle.format ("executing '" % Turtle.fp % "' on '" % Turtle.fp % "'") relScript relSrc
   _ <- timeAndExitOnErr' opts ch cmdLabel [constructCmdText] channelOut channelErr (parAwareProc opts) (hledger, args, stdLines)
   return journalOut
+
